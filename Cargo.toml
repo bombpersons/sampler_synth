@@ -9,6 +9,8 @@ edition = "2021"
 debug = 1
 
 [dependencies]
+midi_player = { git = "https://github.com/bombpersons/midi_player.git" }
+midly = "0.5.2"
 wav = "1.0.0"
 serde = { version = "1.0.144", features = ["derive"] }
 serde_json = "1.0.85"

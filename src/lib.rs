@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{Read, Seek};
 use std::time::{Duration};
 use std::{io, fs};
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use wav::{BitDepth};
 
-use crate::midi::{self, Synth};
+use midi_player::Synth;
 
 struct Channel {
     samples: Vec<f32>
@@ -247,8 +249,8 @@ impl Sample {
 
         // How much faster do we need to sample in order
         // to get the desired frequency?
-        let desired_freq = midi::midi_note_to_freq(desired_midi_note);
-        let sample_freq = midi::midi_note_to_freq(self.midi_note);
+        let desired_freq = midi_player::midi_note_to_freq(desired_midi_note);
+        let sample_freq = midi_player::midi_note_to_freq(self.midi_note);
         let freq_ratio = desired_freq / sample_freq;
 
         // When do we stop sampling?
@@ -413,13 +415,14 @@ impl From<SamplerError> for SamplerBankError {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct SamplerBank {
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    samplers: Vec<Sampler>,
+pub struct SamplerBankJson {
+    voices: HashMap<String, Vec<(usize, usize)>>,
+    folder: String,
+}
 
-    voices: Vec<String>,
-    folder: String
+pub struct SamplerBank {
+    samplers: Vec<Sampler>,
+    voices_to_samplers: HashMap<usize, usize>
 }
 
 impl SamplerBank {
@@ -431,7 +434,12 @@ impl SamplerBank {
 
     pub fn from_json_reader<T: Read>(reader: T) -> Result<Self, SamplerBankError> {
         // Try and parse it.
-        let mut parsed: Self = serde_json::from_reader(reader)?;
+        let parsed: SamplerBankJson = serde_json::from_reader(reader)?;
+
+        let mut bank = Self {
+            samplers: Vec::new(),
+            voices_to_samplers: HashMap::new()
+        };
 
         // Automatically find the samples in the folder.
         let paths = fs::read_dir(&parsed.folder)?;
@@ -458,15 +466,45 @@ impl SamplerBank {
                     let sample = Sample {
                         data: None,
                         filepath: sample_file.path(),
-                        midi_note: midi::note_name_to_midi_note(name.as_str()).unwrap()
+                        midi_note: midi_player::note_name_to_midi_note(name.as_str()).unwrap()
                     };
                     sampler.samples.push(sample);
                 }
             }
-            parsed.samplers.push(sampler);
+            bank.samplers.push(sampler);
         }
 
-        Ok(parsed)
+        // Build a mapping of midi instrument code to sampler index.
+        for (voice_name, codes) in parsed.voices.iter() {
+            // Find the voice in the sampler list.
+            let sampler = bank.get_sampler_by_name(voice_name);
+
+            // If we found it, go over the ranges that the voices is applicable for.
+            if let Some((sampler_index, _)) = sampler {
+                for range in codes.iter() {
+                    // Range is inclusive.
+                    for i in range.0..range.1+1 { 
+                        bank.voices_to_samplers.insert(i, sampler_index);
+                    }   
+                }
+            }
+        }
+
+        Ok(bank)
+    }
+
+    pub fn get_sampler_by_midi_instrument(&self, index: usize) -> Option<&Sampler> {
+        let sampler_index = self.voices_to_samplers.get(&index)?;
+        self.samplers.get(*sampler_index)
+    }
+
+    pub fn get_sampler_by_name(&self, name: &str) -> Option<(usize, &Sampler)> {
+        for (index, sampler) in self.samplers.iter().enumerate() {
+            if sampler.name == name {
+                return Some((index, sampler));
+            }
+        }
+        None
     }
 
     pub fn load_samplers(&mut self) -> Result<(), SamplerBankError> {
@@ -484,6 +522,7 @@ impl SamplerBank {
     }
 }
 
+#[derive(Debug)]
 pub struct Key {
     channel: usize,
     midi_note: usize,
@@ -494,14 +533,18 @@ pub struct Key {
 
 pub struct SamplerSynth {
     bank: SamplerBank,
-    keys: Vec<Key>
+    keys: Vec<Key>,
+
+    // Map of channels to midi voices.
+    voices: HashMap<usize, usize>
 }
 
 impl SamplerSynth {
     pub fn new(bank: SamplerBank) -> Self {
         Self {
             bank,
-            keys: Vec::new()
+            keys: Vec::new(),
+            voices: HashMap::new()
         }
     }
 
@@ -562,6 +605,11 @@ impl Synth for SamplerSynth {
             MidiMessage::NoteOff { key, vel: _ } => {
                 self.note_off(channel, key.as_int() as usize);
             },
+            MidiMessage::ProgramChange { program } => {
+                // Set then instrument on the channel.
+                // Program is the voice.
+                self.voices.insert(channel, program.as_int() as usize);
+            },
             _ => ()
         }
     }
@@ -575,27 +623,29 @@ impl Synth for SamplerSynth {
         // Get the samples from the sampler bank for each note.
         for key in self.keys.iter_mut() {
             // Find the right sampler for the key...
-            let voice_name = &self.bank.voices[key.channel.min(self.bank.voices.len() - 1)];
-
-            let sampler = {
-                let mut choice = None;
-                for sampler in self.bank.samplers.iter() {
-                    if sampler.name == *voice_name {
-                        choice = Some(sampler);
+            match self.voices.get(&key.channel) {
+                None => {
+                    tracing::warn!("No voice for channel {} found", key.channel);
+                    continue;
+                },
+                Some(instrument_code) => {
+                    match self.bank.get_sampler_by_midi_instrument(*instrument_code) {
+                        None => tracing::warn!("No sampler found for instrument {} on channel {}", instrument_code, key.channel),
+                        Some(sampler) => {
+                            // Generate samples.
+                            let samples_generated = sampler.get_samples(output_sample_rate, 
+                                output_channel_count, 
+                                key.midi_note as u8, 
+                                key.vel, 
+                                key.samples_played, 
+                                key.samples_stopped_at, 
+                                output).unwrap();
+                
+                            key.samples_played += samples_generated;
+                        }
                     }
                 }
-                choice
-            }.unwrap();
-
-            let samples_generated = sampler.get_samples(output_sample_rate, 
-                output_channel_count, 
-                key.midi_note as u8, 
-                key.vel, 
-                key.samples_played, 
-                key.samples_stopped_at, 
-                output).unwrap();
-
-            key.samples_played += samples_generated;
+            };
         }
 
         output.len()
@@ -603,5 +653,6 @@ impl Synth for SamplerSynth {
 
     fn reset(&mut self) {
         self.keys = Vec::new();
+        self.voices = HashMap::new();
     }
 }

@@ -1,7 +1,7 @@
 use std::{path::Path};
 
-use rusty_sample_player::midi::{create_player, Frame};
-use rusty_sample_player::sampler::{SamplerSynth, SamplerBank};
+use midi_player::{create_player, Frame};
+use sample_synth::{SamplerSynth, SamplerBank};
 
 use cpal::{traits::{HostTrait, DeviceTrait, StreamTrait}};
 use tracing_subscriber::FmtSubscriber;
@@ -45,16 +45,7 @@ fn main() {
     let (_player_thread, mut player_controller, mut player_output)
          = create_player(supported_config.sample_rate.0 as usize, supported_config.channels as usize, synth);
 
-    // let mut player_controller;
-    // let mut player_output;
-    // {
-    //     let (player_thread, mut test_controller, mut test_output)
-    //         = create_player(supported_config.sample_rate.0 as usize, supported_config.channels as usize, synth);
-    //     player_controller = test_controller;
-    //     player_output = test_output;
-    // }
-
-    player_controller.load_from_file(Path::new("test_mid/ff7.mid")).unwrap();
+    player_controller.load_from_file(Path::new("test_mid/ff9.mid")).unwrap();
     player_controller.play().unwrap();
 
     // build the stream
