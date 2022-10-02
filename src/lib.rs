@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::Hash;
 use std::io::{Read, Seek};
 use std::time::{Duration};
 use std::{io, fs};
@@ -316,7 +315,6 @@ impl From<SampleError> for SamplerError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct Sampler {
     name: String,
     // The wav data for the samples to use.
@@ -441,35 +439,74 @@ impl SamplerBank {
             voices_to_samplers: HashMap::new()
         };
 
-        // Automatically find the samples in the folder.
+        // List all of the paths in the specified folder.
         let paths = fs::read_dir(&parsed.folder)?;
+
+        // Iterate over each directory and populate our samplers.
         for sampler_dir_result in paths {
             let sampler_dir = sampler_dir_result?;
-            if sampler_dir.metadata().unwrap().is_file() {
-                continue;
+
+            // Check if this item is actually a directory.
+            match sampler_dir.metadata() {
+                Ok(metadata) => if metadata.is_file() { continue },
+                Err(e) => tracing::warn!("Couldn't parse {} due to error: {}", sampler_dir.path().display(), e)
             }
 
+            // Figure out the name for the sampler (just use the directory name.)
+            let sampler_name = match sampler_dir.path().file_stem() {
+                None => {
+                    tracing::warn!("Couldn't get sampler directory name. Skipping.");
+                    continue;
+                },
+                Some(name) => {
+                    name.to_string_lossy().to_string()
+                }
+            };
+            
+            // Create the sampler.
             let mut sampler = Sampler {
-                name: sampler_dir.path().file_stem().unwrap().to_str().unwrap().to_string(),
+                name: sampler_name,
                 samples: Vec::new()
             };
 
+            // Look at the file structure and add the individual samples to the sampler.
             let samples = fs::read_dir(sampler_dir.path())?;
             for sample_file_result in samples {
                 let sample_file = sample_file_result?;
-                if let Some(ext) = sample_file.path().extension() {
-                    if ext.to_str().unwrap() != "wav" {
-                        continue;
-                    }
 
-                    let name = sample_file.path().file_stem().unwrap().to_str().unwrap().to_string();
-                    let sample = Sample {
-                        data: None,
-                        filepath: sample_file.path(),
-                        midi_note: midi_player::note_name_to_midi_note(name.as_str()).unwrap()
-                    };
-                    sampler.samples.push(sample);
+                // Only look at files that have a wav extension.
+                match sample_file.path().extension() {
+                    None => continue, // No extension.
+                    Some(ext) => if ext != "wav" { continue; }
                 }
+
+                // Figure out the name for the sample.
+                let sample_name = match sample_file.path().file_stem() {
+                    None => {
+                        tracing::warn!("Couldn't get sampler directory name. Skipping.");
+                        continue;
+                    },
+                    Some(name) => {
+                        name.to_string_lossy().to_string()
+                    }
+                };
+
+                // Calculate the midi note fromthe file name.
+                let midi_note = match midi_player::note_name_to_midi_note(&sample_name) {
+                    Err(e) => {
+                        tracing::warn!("Error parsing sample as note name. {}", e);
+                        continue;
+                    },
+                    Ok(note) => note
+                };
+
+                // Create the sample and add it to the sampler.
+                let sample = Sample {
+                    data: None,
+                    filepath: sample_file.path(),
+                    midi_note
+                };
+                sampler.samples.push(sample);
             }
             bank.samplers.push(sampler);
         }
@@ -550,11 +587,6 @@ impl SamplerSynth {
 
     fn note_on(&mut self, channel: usize, midi_note: usize, vel: usize) {
         tracing::debug!("Key {} on at {} velocity", midi_note, vel);
-        
-        // Actually I don't think this is neccessary.
-        // // Stop the note if it's already on. Some midi files don't give you note_off events
-        // // for playing repeat notes on the same track.
-        // self.note_off(channel, midi_note);
 
         // Add the note.
         self.keys.push(Key {
@@ -623,27 +655,28 @@ impl Synth for SamplerSynth {
         // Get the samples from the sampler bank for each note.
         for key in self.keys.iter_mut() {
             // Find the right sampler for the key...
-            match self.voices.get(&key.channel) {
+            let instrument_code = match self.voices.get(&key.channel) {
                 None => {
                     tracing::warn!("No voice for channel {} found", key.channel);
                     continue;
                 },
-                Some(instrument_code) => {
-                    match self.bank.get_sampler_by_midi_instrument(*instrument_code) {
-                        None => tracing::warn!("No sampler found for instrument {} on channel {}", instrument_code, key.channel),
-                        Some(sampler) => {
-                            // Generate samples.
-                            let samples_generated = sampler.get_samples(output_sample_rate, 
-                                output_channel_count, 
-                                key.midi_note as u8, 
-                                key.vel, 
-                                key.samples_played, 
-                                key.samples_stopped_at, 
-                                output).unwrap();
-                
-                            key.samples_played += samples_generated;
-                        }
-                    }
+                Some(code) => code
+            };
+
+            // Try to get the sampler and generate samples using it.
+            match self.bank.get_sampler_by_midi_instrument(*instrument_code) {
+                None => tracing::warn!("No sampler found for instrument {} on channel {}", instrument_code, key.channel),
+                Some(sampler) => {
+                    // Generate samples.
+                    let samples_generated = sampler.get_samples(output_sample_rate, 
+                        output_channel_count, 
+                        key.midi_note as u8, 
+                        key.vel, 
+                        key.samples_played, 
+                        key.samples_stopped_at, 
+                        output).unwrap();
+        
+                    key.samples_played += samples_generated;
                 }
             };
         }
