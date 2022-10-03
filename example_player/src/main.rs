@@ -1,7 +1,7 @@
 use std::{path::Path};
 
 use midi_player::{create_player, Frame};
-use sample_synth::{SamplerSynth, SamplerBank};
+use midi_synth::{SimpleSynth, VoiceBank};
 
 use cpal::{traits::{HostTrait, DeviceTrait, StreamTrait}};
 use tracing_subscriber::FmtSubscriber;
@@ -36,12 +36,12 @@ fn main() {
         .with_max_sample_rate().config();
 
     // Load the samples
-    let mut test_bank = SamplerBank::from_json_file(Path::new("test_samples/sampler_bank.json")).unwrap();
-    test_bank.load_samplers().unwrap();
+    let mut test_bank = VoiceBank::new();
+    //test_bank.load_samplers().unwrap();
     //test_bank.resample(supported_config.sample_rate.0 as u16);
 
     // Create the player.
-    let synth = SamplerSynth::new(test_bank);
+    let synth = SimpleSynth::new(test_bank, supported_config.sample_rate.0 as usize);
     let (_player_thread, mut player_controller, mut player_output)
          = create_player(supported_config.sample_rate.0 as usize, supported_config.channels as usize, synth);
 

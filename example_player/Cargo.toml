@@ -13,4 +13,4 @@ cpal = "0.14.0"
 tracing = "0.1.36"
 tracing-subscriber = "0.3.15"
 midi_player = { git = "https://github.com/bombpersons/midi_player.git" }
-sample_synth = { path = "../" }
+midi_synth = { path = "../" }
