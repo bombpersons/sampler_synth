@@ -38,6 +38,7 @@ fn main() {
     // Load the samples
     let mut test_bank = SamplerBank::from_json_file(Path::new("test_samples/sampler_bank.json")).unwrap();
     test_bank.load_samplers().unwrap();
+    test_bank.to_json_file(Path::new("test_samples/sampler_bank.json")).unwrap();
     //test_bank.resample(supported_config.sample_rate.0 as u16);
 
     // Create the player.

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::time::{Duration};
 use std::{io, fs};
+use std::io::{Write};
 use std::path::{Path, PathBuf};
 use std::fs::File;
 
 use midly::MidiMessage;
 use rubato::{SincFixedIn, InterpolationParameters, InterpolationType, ResamplerConstructionError, Resampler, ResampleError};
 use serde::{Deserialize, Serialize};
+use pitch_detection::detector::mcleod::McLeodDetector;
+use pitch_detection::detector::PitchDetector;
 
 use wav::{BitDepth};
 
@@ -101,6 +104,30 @@ impl WavData {
         Ok(data)
     }
 
+    pub fn calculate_pitch(&self) -> Option<f32> {
+        const POWER_THRESHOLD: f32 = 5.0;
+        const CLARITY_THRESHOLD: f32 = 0.7;
+
+        let mut pitches = Vec::new();
+        for channel in self.channels.iter() {
+            let size = channel.samples.len();
+            let padding = size*2;
+
+            let mut detector = McLeodDetector::new(channel.samples.len(), padding);
+            match detector.get_pitch(&channel.samples, self.sample_rate as usize, POWER_THRESHOLD, CLARITY_THRESHOLD)
+            {
+                None => (),
+                Some(pitch) => pitches.push(pitch.frequency)
+            }
+        }
+
+        if pitches.is_empty() {
+            None
+        } else {
+            Some(pitches.iter().sum::<f32>() / pitches.len() as f32)
+        }
+    }
+
     pub fn resample(&self, new_sample_rate: u16) -> Result<Self, WavDataError> {
         tracing::info!("Resampling from {} samples per second to {} samples per second...", self.sample_rate, new_sample_rate);
 
@@ -166,7 +193,7 @@ impl From<WavDataError> for SampleError {
 #[derive(Serialize, Deserialize)]
 struct Sample {
     filepath: PathBuf,
-    midi_note: u8,
+    pitch: Option<f32>,
 
     #[serde(skip_serializing)]
     #[serde(skip_deserializing)]
@@ -175,7 +202,20 @@ struct Sample {
 
 impl Sample {
     pub fn load(&mut self) -> Result<(), SampleError> {
-        self.data = Some(WavData::from_file(&self.filepath)?);
+        let wav_data = WavData::from_file(&self.filepath)?;
+
+        // Detect the pitch of the sample.
+        if self.pitch.is_none() {
+            tracing::info!("Autodetecting pitch for {}.", self.filepath.display());
+            self.pitch = wav_data.calculate_pitch();
+            match self.pitch {
+                Some(pitch) => tracing::info!("Frequency detected to be {} for {}.", pitch, self.filepath.display()),
+                None => tracing::warn!("Pitch couldn't be detected for {}.", self.filepath.display())
+            };
+        }
+
+        self.data = Some(wav_data);
+
         Ok(())
     }
 
@@ -236,8 +276,15 @@ impl Sample {
             }
         }
     }
+
+    pub fn get_pitch(&self) -> f32 {
+        match self.pitch {
+            Some(pitch) => pitch,
+            None => 440.0
+        }
+    }
     
-    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, desired_midi_note: u8, volume: f32, mut progress: usize, samples_stopped_at: Option<usize>, output: &mut [f32]) -> Result<usize, SampleError> {
+    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, desired_pitch: f32, volume: f32, mut progress: usize, samples_stopped_at: Option<usize>, output: &mut [f32]) -> Result<usize, SampleError> {
         // Ratio of output samples per actual samples.
         let sample_rate = self.get_sample_rate()?;
         let output_sample_num = output.len() / output_channels;
@@ -248,8 +295,8 @@ impl Sample {
 
         // How much faster do we need to sample in order
         // to get the desired frequency?
-        let desired_freq = midi_player::midi_note_to_freq(desired_midi_note);
-        let sample_freq = midi_player::midi_note_to_freq(self.midi_note);
+        let desired_freq = desired_pitch;
+        let sample_freq = self.get_pitch();
         let freq_ratio = desired_freq / sample_freq;
 
         // When do we stop sampling?
@@ -315,6 +362,7 @@ impl From<SampleError> for SamplerError {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Sampler {
     name: String,
     // The wav data for the samples to use.
@@ -324,20 +372,6 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    // Create a sampler from a single file.
-    pub fn from_single_file(filepath: &Path, name: &str, midi_note: u8) -> Self {
-        let wav = WavData::from_file(filepath)
-            .expect(format!("Couldn't load wave file at {}", filepath.display()).as_str());
-
-        let mut samples = Vec::new();
-        samples.push(Sample { filepath: filepath.to_owned(), data: Some(wav), midi_note });
-
-        Self {
-            name: name.to_string(),
-            samples,
-        }
-    }
-
     pub fn load_samples(&mut self) -> Result<(), SamplerError> {
         for sample in self.samples.iter_mut() {
             sample.load()?;
@@ -355,14 +389,14 @@ impl Sampler {
     }
 
     // Retrieve the samples for a particular note. Returns the number of samples returned.
-    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, midi_note: u8, volume: f32, progress: usize, time_stopped: Option<usize>, output: &mut [f32]) -> Result<usize, SamplerError> {
+    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, pitch: f32, volume: f32, progress: usize, time_stopped: Option<usize>, output: &mut [f32]) -> Result<usize, SamplerError> {
         // Pick the sample with the closest midi note.
         let mut closest_sample = None;
         for sample in self.samples.iter() {
             closest_sample = match closest_sample {
                 None => Some(sample),
                 Some(closest) => {
-                    if sample.midi_note.abs_diff(midi_note) < closest.midi_note.abs_diff(midi_note) {
+                    if (sample.get_pitch() - pitch).abs() < (closest.get_pitch() - pitch).abs() {
                         Some(sample)
                     } else {
                         Some(closest)
@@ -378,7 +412,7 @@ impl Sampler {
         let sampled = 
             sample.get_samples(output_sample_rate, 
                 output_channels, 
-                midi_note, 
+                pitch, 
                 volume,
                 progress, 
                 time_stopped, 
@@ -413,17 +447,32 @@ impl From<SamplerError> for SamplerBankError {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct SamplerBankJson {
+pub struct SamplerBank {
     voices: HashMap<String, Vec<(usize, usize)>>,
     folder: String,
-}
-
-pub struct SamplerBank {
     samplers: Vec<Sampler>,
+
+    #[serde(skip_serializing)]
+    #[serde(skip_deserializing)]
     voices_to_samplers: HashMap<usize, usize>
 }
 
 impl SamplerBank {
+    pub fn to_json_file(&self, filepath: &Path) -> Result<(), SamplerBankError> {
+        // Try and open the file.
+        let file = File::create(filepath)?;
+        self.to_json_writer(file);
+
+        Ok(())
+    }
+
+    pub fn to_json_writer<T: Write>(&self, mut writer: T) -> Result<(), SamplerBankError> {
+        let json_string = serde_json::to_string_pretty(&self)?;
+        writer.write(json_string.as_bytes());
+
+        Ok(())
+    }
+
     pub fn from_json_file(filepath: &Path) -> Result<Self, SamplerBankError> {
         // Try and open the file.
         let file = File::open(filepath)?;
@@ -432,56 +481,26 @@ impl SamplerBank {
 
     pub fn from_json_reader<T: Read>(reader: T) -> Result<Self, SamplerBankError> {
         // Try and parse it.
-        let parsed: SamplerBankJson = serde_json::from_reader(reader)?;
+        let mut parsed: SamplerBank = serde_json::from_reader(reader)?;
 
-        let mut bank = Self {
-            samplers: Vec::new(),
-            voices_to_samplers: HashMap::new()
-        };
+        // Automatically fill the samplers out using the directory specified.
+        // If there are samplers already, don't do this.
+        if parsed.samplers.is_empty() {
+            // List all of the paths in the specified folder.
+            let paths = fs::read_dir(&parsed.folder)?;
 
-        // List all of the paths in the specified folder.
-        let paths = fs::read_dir(&parsed.folder)?;
+            // Iterate over each directory and populate our samplers.
+            for sampler_dir_result in paths {
+                let sampler_dir = sampler_dir_result?;
 
-        // Iterate over each directory and populate our samplers.
-        for sampler_dir_result in paths {
-            let sampler_dir = sampler_dir_result?;
-
-            // Check if this item is actually a directory.
-            match sampler_dir.metadata() {
-                Ok(metadata) => if metadata.is_file() { continue },
-                Err(e) => tracing::warn!("Couldn't parse {} due to error: {}", sampler_dir.path().display(), e)
-            }
-
-            // Figure out the name for the sampler (just use the directory name.)
-            let sampler_name = match sampler_dir.path().file_stem() {
-                None => {
-                    tracing::warn!("Couldn't get sampler directory name. Skipping.");
-                    continue;
-                },
-                Some(name) => {
-                    name.to_string_lossy().to_string()
-                }
-            };
-            
-            // Create the sampler.
-            let mut sampler = Sampler {
-                name: sampler_name,
-                samples: Vec::new()
-            };
-
-            // Look at the file structure and add the individual samples to the sampler.
-            let samples = fs::read_dir(sampler_dir.path())?;
-            for sample_file_result in samples {
-                let sample_file = sample_file_result?;
-
-                // Only look at files that have a wav extension.
-                match sample_file.path().extension() {
-                    None => continue, // No extension.
-                    Some(ext) => if ext != "wav" { continue; }
+                // Check if this item is actually a directory.
+                match sampler_dir.metadata() {
+                    Ok(metadata) => if metadata.is_file() { continue },
+                    Err(e) => tracing::warn!("Couldn't parse {} due to error: {}", sampler_dir.path().display(), e)
                 }
 
-                // Figure out the name for the sample.
-                let sample_name = match sample_file.path().file_stem() {
+                // Figure out the name for the sampler (just use the directory name.)
+                let sampler_name = match sampler_dir.path().file_stem() {
                     None => {
                         tracing::warn!("Couldn't get sampler directory name. Skipping.");
                         continue;
@@ -490,44 +509,73 @@ impl SamplerBank {
                         name.to_string_lossy().to_string()
                     }
                 };
-
-                // Calculate the midi note fromthe file name.
-                let midi_note = match midi_player::note_name_to_midi_note(&sample_name) {
-                    Err(e) => {
-                        tracing::warn!("Error parsing sample as note name. {}", e);
-                        continue;
-                    },
-                    Ok(note) => note
+                
+                // Create the sampler.
+                let mut sampler = Sampler {
+                    name: sampler_name,
+                    samples: Vec::new()
                 };
 
-                // Create the sample and add it to the sampler.
-                let sample = Sample {
-                    data: None,
-                    filepath: sample_file.path(),
-                    midi_note
-                };
-                sampler.samples.push(sample);
+                // Look at the file structure and add the individual samples to the sampler.
+                let samples = fs::read_dir(sampler_dir.path())?;
+                for sample_file_result in samples {
+                    let sample_file = sample_file_result?;
+
+                    // Only look at files that have a wav extension.
+                    match sample_file.path().extension() {
+                        None => continue, // No extension.
+                        Some(ext) => if ext != "wav" { continue; }
+                    }
+
+                    // Figure out the name for the sample.
+                    let sample_name = match sample_file.path().file_stem() {
+                        None => {
+                            tracing::warn!("Couldn't get sampler directory name. Skipping.");
+                            continue;
+                        },
+                        Some(name) => {
+                            name.to_string_lossy().to_string()
+                        }
+                    };
+
+                    // Calculate the midi note fromthe file name.
+                    let pitch = match midi_player::note_name_to_midi_note(&sample_name) {
+                        Err(e) => {
+                            tracing::info!("Error parsing note name from sample filename. Will use auto detection. Error: {}", e);
+                            None
+                        },
+                        Ok(note) => Some(midi_player::midi_note_to_freq(note))
+                    };
+
+                    // Create the sample and add it to the sampler.
+                    let sample = Sample {
+                        data: None,
+                        filepath: sample_file.path(),
+                        pitch
+                    };
+                    sampler.samples.push(sample);
+                }
+                parsed.samplers.push(sampler);
             }
-            bank.samplers.push(sampler);
         }
 
         // Build a mapping of midi instrument code to sampler index.
         for (voice_name, codes) in parsed.voices.iter() {
             // Find the voice in the sampler list.
-            let sampler = bank.get_sampler_by_name(voice_name);
+            let sampler = parsed.get_sampler_by_name(voice_name);
 
             // If we found it, go over the ranges that the voices is applicable for.
             if let Some((sampler_index, _)) = sampler {
                 for range in codes.iter() {
                     // Range is inclusive.
                     for i in range.0..range.1+1 { 
-                        bank.voices_to_samplers.insert(i, sampler_index);
+                        parsed.voices_to_samplers.insert(i, sampler_index);
                     }   
                 }
             }
         }
 
-        Ok(bank)
+        Ok(parsed)
     }
 
     pub fn get_sampler_by_midi_instrument(&self, index: usize) -> Option<&Sampler> {
@@ -670,7 +718,7 @@ impl Synth for SamplerSynth {
                     // Generate samples.
                     let samples_generated = sampler.get_samples(output_sample_rate, 
                         output_channel_count, 
-                        key.midi_note as u8, 
+                        midi_player::midi_note_to_freq(key.midi_note as u8), 
                         key.vel, 
                         key.samples_played, 
                         key.samples_stopped_at, 
