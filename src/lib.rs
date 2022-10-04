@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration};
 use std::{io, fs};
 use std::path::{Path, PathBuf};
 use std::fs::File;
 
+use fundsp::hacker32::{envelope, wave32, declick, timer, constant};
 use midly::MidiMessage;
 use rubato::{SincFixedIn, InterpolationParameters, InterpolationType, ResamplerConstructionError, Resampler, ResampleError};
 use serde::{Deserialize, Serialize};
 
+use fundsp::wave::{Wave32};
+use fundsp::prelude::{AudioUnit32, lerp};
 use wav::{BitDepth};
 
 use midi_player::Synth;
@@ -42,118 +46,44 @@ impl From<ResampleError> for WavDataError {
     }
 }
 
-struct WavData {
-    sample_rate: u16,
-    channels: Vec<Channel>,
-    sample_length: usize
+pub fn wave32_from_file(filepath: &Path) -> Result<Wave32, WavDataError> {
+    tracing::info!("Loading {}", filepath.display());
+
+    // Open the file...
+    let mut file = File::open(filepath)?;
+    wave32_from_reader(&mut file)
 }
 
-impl WavData {
-    pub fn from_file(filepath: &Path) -> Result<Self, WavDataError> {
-        tracing::info!("Loading {}", filepath.display());
+pub fn wave32_from_reader<T: Read + Seek>(reader: &mut T) -> Result<Wave32, WavDataError> {
+    let (header, data) = wav::read(reader)?;
 
-        // Open the file...
-        let mut file = File::open(filepath)?;
-        Self::from_reader(&mut file)
+    // Convert samples to f32
+    let samples = match data {
+        BitDepth::ThirtyTwoFloat(samples) => samples,
+        BitDepth::TwentyFour(samples) => samples
+            .iter().map(|s| ((*s as f32 + i32::MAX as f32) / (i32::MAX as f32 - i32::MIN as f32) - 0.5) * 2.0).collect(),
+        BitDepth::Sixteen(samples) => samples
+            .iter().map(|s| ((*s as f32 + i16::MAX as f32) / (i16::MAX as f32 - i16::MIN as f32) - 0.5) * 2.0).collect(),
+        BitDepth::Eight(samples) => samples
+            .iter().map(|s| ((*s as f32 / u8::MAX as f32) - 0.5) * 2.0).collect(),
+        BitDepth::Empty => Vec::new()
+    };
+
+    // Create the wav32 to store the data.
+    let sample_count = samples.len()/header.channel_count as usize;
+    let mut wave32 = Wave32::with_capacity(header.channel_count as usize, header.sampling_rate as f64, sample_count);
+    wave32.resize(sample_count);
+    for (index, frame) in samples.chunks_exact(wave32.channels()).enumerate() {
+        for (channel, sample) in frame.iter().enumerate() {
+            wave32.set(channel, index, *sample);
+        }
     }
 
-    pub fn from_reader<T: Read + Seek>(reader: &mut T) -> Result<Self, WavDataError> {
-        let (header, data) = wav::read(reader)?;
-
-        // Convert samples to f32
-        let samples = match data {
-            BitDepth::ThirtyTwoFloat(samples) => samples,
-            BitDepth::TwentyFour(samples) => samples
-                .iter().map(|s| ((*s as f32 + i32::MAX as f32) / (i32::MAX as f32 - i32::MIN as f32) - 0.5) * 2.0).collect(),
-            BitDepth::Sixteen(samples) => samples
-                .iter().map(|s| ((*s as f32 + i16::MAX as f32) / (i16::MAX as f32 - i16::MIN as f32) - 0.5) * 2.0).collect(),
-            BitDepth::Eight(samples) => samples
-                .iter().map(|s| ((*s as f32 / u8::MAX as f32) - 0.5) * 2.0).collect(),
-            BitDepth::Empty => Vec::new()
-        };
-
-        // Format the data. Separate the channels into vectors
-        // for easy access. Plus our resampler needs them like this.
-        let mut channels = Vec::new();
-        for _ in 0..header.channel_count {
-            channels.push(Channel {
-                samples: Vec::new()
-            });
-        }
-        for frame in samples.chunks_exact(header.channel_count as usize) {
-            for (i, s) in frame.iter().enumerate() {
-                channels[i].samples.push(*s);
-            }
-        }
-
-        // Record the length of the sample. All channels *should* be the same length.
-        let sample_length = if channels.len() > 0 {
-            channels[0].samples.len()
-        } else {
-            0
-        };
-
-        let data = WavData {
-            sample_rate: header.sampling_rate as u16,
-            channels,
-            sample_length
-        };
-        Ok(data)
-    }
-
-    pub fn resample(&self, new_sample_rate: u16) -> Result<Self, WavDataError> {
-        tracing::info!("Resampling from {} samples per second to {} samples per second...", self.sample_rate, new_sample_rate);
-
-        // Create the resampler...
-        // I have no idea what these options really do, just using the ones used on the readme.
-        let params = InterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: InterpolationType::Linear,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2
-        };
-        let mut resampler = SincFixedIn::<f32>::new(
-            new_sample_rate as f64 /  self.sample_rate as f64,
-            2.0,
-            params,
-            self.sample_length,
-            self.channels.len()
-        )?;
-
-        // Construct the vectors required for rubato
-        let mut waves_in = Vec::new();
-        for channel in self.channels.iter() {
-            waves_in.push(channel.samples.to_vec());
-        }
-
-        // Process
-        let waves_out = resampler.process(&waves_in, None)?;
-
-        // Put the data back into channels
-        let mut channels = Vec::new();
-        for c in waves_out.iter() {
-            channels.push(Channel { samples: c.to_vec() });
-        };
-
-        // Construct the new wavdata.
-        let new = Self {
-            channels,
-            sample_length: self.sample_length,
-            sample_rate: new_sample_rate
-        };
-
-        tracing::info!("Resampled.");
-
-        Ok(new)
-    }
+    Ok(wave32)
 }
 
 #[derive(Debug)]
 pub enum SampleError {
-    SampleNotLoaded,
-    ChannelOutOfBounds,
-    SampleOutOfBounds,
     WavDataError(WavDataError)
 }
 
@@ -163,142 +93,17 @@ impl From<WavDataError> for SampleError {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Sample {
+pub struct Sample {
     filepath: PathBuf,
-    midi_note: u8,
+    midi_note: usize,
 
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    data: Option<WavData>
+    data: Option<Arc<Wave32>>
 }
 
 impl Sample {
     pub fn load(&mut self) -> Result<(), SampleError> {
-        self.data = Some(WavData::from_file(&self.filepath)?);
+        self.data = Some(Arc::new(wave32_from_file(&self.filepath)?));
         Ok(())
-    }
-
-    pub fn resample(&mut self, new_sample_rate: u16) -> Result<(), SampleError> {
-        if self.data.is_none() {
-            return Err(SampleError::SampleNotLoaded);
-        }
-
-        self.data = Some(self.data.as_ref().unwrap().resample(new_sample_rate)?);
-        Ok(())
-    }
-
-    pub fn get_channel(&self, channel: usize) -> Result<&Channel, SampleError> {
-        if self.data.is_none() {
-            return Err(SampleError::SampleNotLoaded);
-        }
-
-        let channel = self.data.as_ref().unwrap().channels.get(channel);
-        match channel {
-            Some(c) => Ok(c),
-            None => Err(SampleError::ChannelOutOfBounds)
-        }
-    }
-
-    pub fn get_sample_rate(&self) -> Result<u16, SampleError> {
-        if self.data.is_none() {
-            return Err(SampleError::SampleNotLoaded);
-        }
-        Ok(self.data.as_ref().unwrap().sample_rate)
-    }
-
-    pub fn get_sample_channel_count(&self) -> Result<usize, SampleError> {
-        if self.data.is_none() {
-            return Err(SampleError::SampleNotLoaded);
-        }
-        Ok(self.data.as_ref().unwrap().channels.len())
-    }
-
-    pub fn get_sample_interpolated(&self, index: f32, channel: usize) -> Result<f32, SampleError> {
-        let channel = self.get_channel(channel)?;
-
-        let low_sample_index = index.floor() as usize;
-        let high_sample_index = index.ceil() as usize;
-
-        // If we have no low sample error
-        match channel.samples.get(low_sample_index) {
-            None => Err(SampleError::SampleOutOfBounds),
-            Some(low_sample) => {
-                // Try and get the high sample and interpolate. If it doesn't exist, just return then low one.
-                match channel.samples.get(high_sample_index) {
-                    Some(high_sample) => {
-                        // Interpolate between both samples.
-                        let remainder = index - low_sample_index as f32;
-                        Ok(low_sample + remainder * (high_sample - low_sample))
-                    },
-                    _ => Ok(*low_sample),
-                }
-            }
-        }
-    }
-    
-    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, desired_midi_note: u8, volume: f32, mut progress: usize, samples_stopped_at: Option<usize>, output: &mut [f32]) -> Result<usize, SampleError> {
-        // Ratio of output samples per actual samples.
-        let sample_rate = self.get_sample_rate()?;
-        let output_sample_num = output.len() / output_channels;
-        let samples_per_output_sample = sample_rate as f32 / output_sample_rate as f32;
-
-        // How many channels are in this sample.
-        let sample_channels = self.get_sample_channel_count()?;
-
-        // How much faster do we need to sample in order
-        // to get the desired frequency?
-        let desired_freq = midi_player::midi_note_to_freq(desired_midi_note);
-        let sample_freq = midi_player::midi_note_to_freq(self.midi_note);
-        let freq_ratio = desired_freq / sample_freq;
-
-        // When do we stop sampling?
-        let mut sampled = 0;
-        while sampled < output_sample_num {
-            // Calculate the sample index we need to be getting right now.
-            let sample_index = progress as f32 * samples_per_output_sample as f32 * freq_ratio;
-            let progress_as_time = Duration::from_secs_f32(progress as f32 / output_sample_rate as f32);
-
-            //tracing::info!("Sample_index: {}", sample_index);
-
-            // Fill out each channel.
-            for channel in 0..output_channels {
-                let channel_to_sample = (sample_channels-1).min(channel);
-                let sample = match self.get_sample_interpolated(sample_index, channel_to_sample) {
-                    Err(SampleError::SampleOutOfBounds) => { // Sample out of bounds, return 0.0
-                        Ok(0.0)
-                    },
-                    Ok(mut sample) => {
-                        // Fade in the first moment of the sample to avoid clipping.
-                        const FADE_IN_DURATION: f32 = 0.01;
-                        let fade_in = (progress_as_time.as_secs_f32() / FADE_IN_DURATION).min(1.0);
-                        sample *= fade_in;
-
-                        // Fade out in the last moment of the sample to avoid clipping.
-                        const FADE_OUT_DURATION: f32 = 0.1;
-                        if let Some(samples_stopped_at) = samples_stopped_at {
-                            let time_stopped_at = Duration::from_secs_f32(samples_stopped_at as f32 / output_sample_rate as f32);
-                            let duration_since_stopped = (progress_as_time - time_stopped_at).max(Duration::ZERO);
-                            let fade_out = 1.0 - (duration_since_stopped.as_secs_f32() / FADE_OUT_DURATION).min(1.0);
-
-                            sample *= fade_out;
-                        }
-
-                        // Volume
-                        sample *= volume;
-
-                        Ok(sample)
-                    },
-                    Err(e) => Err(e), // Return the error unmodified
-                }?;
-                output[sampled*output_channels + channel] += sample;
-            }
-
-            progress += 1;
-            sampled += 1;
-        }
-
-        Ok(output_sample_num)
     }
 }
 
@@ -324,20 +129,6 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    // Create a sampler from a single file.
-    pub fn from_single_file(filepath: &Path, name: &str, midi_note: u8) -> Self {
-        let wav = WavData::from_file(filepath)
-            .expect(format!("Couldn't load wave file at {}", filepath.display()).as_str());
-
-        let mut samples = Vec::new();
-        samples.push(Sample { filepath: filepath.to_owned(), data: Some(wav), midi_note });
-
-        Self {
-            name: name.to_string(),
-            samples,
-        }
-    }
-
     pub fn load_samples(&mut self) -> Result<(), SamplerError> {
         for sample in self.samples.iter_mut() {
             sample.load()?;
@@ -346,16 +137,7 @@ impl Sampler {
         Ok(())
     }
 
-    // Resample all samples to a new sample rate.
-    pub fn resample(&mut self, new_sample_rate: u16) -> Result<(), SamplerError> {
-        for sample in self.samples.iter_mut() {
-            sample.resample(new_sample_rate)?;
-        }
-        Ok(())
-    }
-
-    // Retrieve the samples for a particular note. Returns the number of samples returned.
-    pub fn get_samples(&self, output_sample_rate: usize, output_channels: usize, midi_note: u8, volume: f32, progress: usize, time_stopped: Option<usize>, output: &mut [f32]) -> Result<usize, SamplerError> {
+    pub fn get_closest_sample(&self, midi_note: usize) -> Option<&Sample> {
         // Pick the sample with the closest midi note.
         let mut closest_sample = None;
         for sample in self.samples.iter() {
@@ -370,20 +152,7 @@ impl Sampler {
                 }
             }
         }
-        if closest_sample.is_none() {
-            return Err(SamplerError::NoSamplesFound);
-        }
-
-        let sample = closest_sample.unwrap();
-        let sampled = 
-            sample.get_samples(output_sample_rate, 
-                output_channels, 
-                midi_note, 
-                volume,
-                progress, 
-                time_stopped, 
-                output)?;
-        Ok(sampled)
+        closest_sample
     }
 }
 
@@ -504,7 +273,7 @@ impl SamplerBank {
                 let sample = Sample {
                     data: None,
                     filepath: sample_file.path(),
-                    midi_note
+                    midi_note: midi_note as usize
                 };
                 sampler.samples.push(sample);
             }
@@ -550,76 +319,198 @@ impl SamplerBank {
         }
         Ok(())
     }
-
-    pub fn resample(&mut self, new_sample_rate: u16) -> Result<(), SamplerBankError> {
-        for sampler in self.samplers.iter_mut() {
-            sampler.resample(new_sample_rate)?;
-        }
-        Ok(())
-    }
 }
 
-#[derive(Debug)]
-pub struct Key {
+pub struct SamplerVoice {
     channel: usize,
     midi_note: usize,
     vel: f32,
-    samples_played: usize,
-    samples_stopped_at: Option<usize>
+
+    // The audio node that plays our sample.
+    audio_node: Box<dyn AudioUnit32>,
+
+    // So that we can tell the audio node when we have released the key.
+    time_released: Arc<Mutex<Option<f32>>>,
+
+    // The total duration of the sample. So we know when we've finished playing.
+    sample_duration: f32
+}
+
+#[derive(Debug)]
+pub enum SampleVoiceError {
+    NoSampleFound,
+    SampleNotLoaded
+}
+
+// Tag the time in the audio graph so that we can get access it later when the sample is playing.
+const SAMPLERVOICE_TIMER_TAG: i64 = 0;
+const SAMPLERVOICE_FADE_TIME: f32 = 0.1;
+impl SamplerVoice {
+    pub fn from_sampler(sampler: &Sampler, sample_rate: usize, channel: usize, midi_note: usize, vel: f32) -> Result<SamplerVoice, SampleVoiceError> {
+        // Create a fade that so when a key is released, the sample fades out rather than
+        // stopping abruptly.
+        let time_released = Arc::new(Mutex::new(None));
+        let volume_modulation = {
+            let time_released = time_released.clone();
+            envelope(move |t| {
+                let time_released = time_released.lock().unwrap();
+                match *time_released {
+                    None => 1.0,
+                    Some(released) => lerp(1.0, 0.0, ((released - t) as f32 / SAMPLERVOICE_FADE_TIME).min(1.0))
+                }
+            })
+        };
+
+        // Get the sample data.
+        let sample = sampler.get_closest_sample(midi_note)
+            .ok_or(SampleVoiceError::NoSampleFound)?;
+        let sample_data = sample.data.as_ref()
+            .ok_or(SampleVoiceError::SampleNotLoaded)?;
+
+        // Create an audio node that can play the sample.
+        let mut audio_node = 
+            timer(SAMPLERVOICE_TIMER_TAG) |
+            (
+                wave32(sample_data.clone(), 0, None) >> declick() * constant(vel) |
+                wave32(sample_data.clone(), 1, None) >> declick() * constant(vel)
+            );
+        audio_node.reset(Some(sample_rate as f64));
+
+        // Create the voice and return it.
+        let voice = Self {
+            channel,
+            midi_note,
+            vel,
+            audio_node: Box::new(audio_node),
+            time_released,
+            sample_duration: sample_data.duration() as f32
+        };
+        Ok(voice)
+    }
+
+    pub fn get_time_played(&self) -> f32 {
+        self.audio_node.get(SAMPLERVOICE_TIMER_TAG)
+            .expect("The time tag should always be present!") as f32
+    }
+
+    pub fn set_released(&mut self) {
+        let mut time_released = self.time_released.lock().unwrap();
+        let current_time = self.get_time_played();
+        *time_released = Some(current_time as f32);
+    }
+
+    pub fn is_pressed(&self) -> bool {
+        let mut time_released = self.time_released.lock().unwrap();
+        time_released.is_none() 
+    }
+
+    pub fn is_finished(&self) -> bool {
+        let time_released = self.time_released.lock().unwrap();
+        let current_time = self.get_time_played();
+        
+        current_time > self.sample_duration ||
+        match *time_released {
+            None => false,
+            Some(time_released) => current_time > time_released + SAMPLERVOICE_FADE_TIME
+        }
+    }
+
+    pub fn get_samples(&mut self, output_channel_count: usize, output: &mut [f32]) {
+        const MAX_CHANNEL_COUNT: usize = 2;
+
+        let freq = midi_player::midi_note_to_freq(self.midi_note as u8);
+        let inputs = [freq];
+
+        let voice_output_count = self.audio_node.outputs();
+        if voice_output_count > MAX_CHANNEL_COUNT {
+            panic!("Voice has too many outputs / channels!");
+        }
+
+        // Generate samples for each of these buffers.
+        let mut temp_buf = [0.0; MAX_CHANNEL_COUNT];
+        for frame in output.chunks_exact_mut(output_channel_count) {
+            // The output from the audio node.
+            self.audio_node.tick(&inputs, &mut temp_buf[..voice_output_count]);
+
+            for channel in 0..output_channel_count {
+                if channel >= voice_output_count {
+                    frame[channel] += temp_buf[voice_output_count-1];
+                } else {
+                    frame[channel] += temp_buf[channel];
+                }
+            }
+        }
+    } 
 }
 
 pub struct SamplerSynth {
     bank: SamplerBank,
-    keys: Vec<Key>,
+    voices: Vec<SamplerVoice>,
+    sample_rate: usize,
 
     // Map of channels to midi voices.
-    voices: HashMap<usize, usize>
+    midi_instrument_to_sample_index: HashMap<usize, usize>
 }
 
 impl SamplerSynth {
     pub fn new(bank: SamplerBank) -> Self {
         Self {
             bank,
-            keys: Vec::new(),
-            voices: HashMap::new()
+            voices: Vec::new(),
+            sample_rate: 0, // Get's set the first time gen_samples() is called.
+
+            midi_instrument_to_sample_index: HashMap::new()
         }
     }
 
     fn note_on(&mut self, channel: usize, midi_note: usize, vel: usize) {
         tracing::debug!("Key {} on at {} velocity", midi_note, vel);
 
-        // Add the note.
-        self.keys.push(Key {
+        // Find the correct sampler.
+        let instrument_code = match self.midi_instrument_to_sample_index.get(&channel) {
+            None => {
+                tracing::warn!("No voice for channel {} found", channel);
+                return;
+            },
+            Some(code) => code
+        };
+
+        let sampler = match self.bank.get_sampler_by_midi_instrument(*instrument_code) {
+            None => {
+                tracing::warn!("No sampler found for instrument {} on channel {}", instrument_code, channel);
+                return;
+            }
+            Some(sampler) => sampler
+        };
+
+        // Add the voice
+        let voice = SamplerVoice::from_sampler(sampler,
+            self.sample_rate,
             channel,
             midi_note, 
-            vel: vel as f32 / 127.0,
-            samples_played: 0,
-            samples_stopped_at: None
-        });
+            vel as f32 / 127.0
+        ).expect("Error creating SamplerVoice.");
+        self.voices.push(voice);
     }
 
     fn note_off(&mut self, channel: usize, midi_note: usize) {
         tracing::debug!("Key {} off", midi_note);
 
         // Find the note and record the time it stopped.
-        for key in self.keys.iter_mut() {
+        for key in self.voices.iter_mut() {
             if key.channel == channel && 
                key.midi_note == midi_note && 
-               key.samples_stopped_at.is_none() {
+               key.is_pressed() {
 
-                key.samples_stopped_at = Some(key.samples_played);
+                key.set_released();
             }
         }
     }
 
     fn purge_finished_notes(&mut self, threshold: usize) {
         // Get rid of any notes that have played more than the threshold of samples past where they stopped.
-        self.keys.retain(|key| {
-            if let Some(stopped_at) = key.samples_stopped_at {
-                key.samples_played - stopped_at <= threshold
-            } else {
-                true
-            }   
+        self.voices.retain(|key| {
+            !key.is_finished()
         });
     }
 }
@@ -640,52 +531,31 @@ impl Synth for SamplerSynth {
             MidiMessage::ProgramChange { program } => {
                 // Set then instrument on the channel.
                 // Program is the voice.
-                self.voices.insert(channel, program.as_int() as usize);
+                self.midi_instrument_to_sample_index.insert(channel, program.as_int() as usize);
             },
             _ => ()
         }
     }
 
     fn gen_samples(&mut self, output_sample_rate: usize, output_channel_count: usize, output: &mut [f32]) -> usize {
+        // Store the sample rate requested.
+        self.sample_rate = output_sample_rate;
+
         // Purge any finished notes.
         self.purge_finished_notes(output_sample_rate); // 1 second.
 
-        tracing::debug!("Generating {} samples. {} Keys turned on.", output.len() / output_channel_count, self.keys.len());
+        tracing::debug!("Generating {} samples. {} Keys turned on.", output.len() / output_channel_count, self.voices.len());
 
         // Get the samples from the sampler bank for each note.
-        for key in self.keys.iter_mut() {
-            // Find the right sampler for the key...
-            let instrument_code = match self.voices.get(&key.channel) {
-                None => {
-                    tracing::warn!("No voice for channel {} found", key.channel);
-                    continue;
-                },
-                Some(code) => code
-            };
-
-            // Try to get the sampler and generate samples using it.
-            match self.bank.get_sampler_by_midi_instrument(*instrument_code) {
-                None => tracing::warn!("No sampler found for instrument {} on channel {}", instrument_code, key.channel),
-                Some(sampler) => {
-                    // Generate samples.
-                    let samples_generated = sampler.get_samples(output_sample_rate, 
-                        output_channel_count, 
-                        key.midi_note as u8, 
-                        key.vel, 
-                        key.samples_played, 
-                        key.samples_stopped_at, 
-                        output).unwrap();
-        
-                    key.samples_played += samples_generated;
-                }
-            };
+        for key in self.voices.iter_mut() {
+            key.get_samples(output_channel_count, output);
         }
 
         output.len()
     }
 
     fn reset(&mut self) {
-        self.keys = Vec::new();
-        self.voices = HashMap::new();
+        self.voices = Vec::new();
+        self.midi_instrument_to_sample_index = HashMap::new();
     }
 }
